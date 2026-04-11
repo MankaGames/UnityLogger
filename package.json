@@ -1,0 +1,10 @@
+{
+  "name": "com.manka.loghandler",
+  "version": "1.0.0",
+  "displayName": "Manka Log Handler",
+  "description": "File-based Unity log handler with duplicate filtering, auto-rotation and crash report export.",
+  "unity": "2021.3",
+  "author": {
+    "name": "MankaGames"
+  }
+}
