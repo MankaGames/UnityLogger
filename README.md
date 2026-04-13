@@ -16,13 +16,13 @@ File-based Unity log handler with duplicate filtering, automatic log rotation, a
 Add to your project's `Packages/manifest.json`:
 
 ```json
-"com.manka.loghandler": "git+ssh://git@github.com/MankaGames/UnityLogger.git"
+"com.manka.loghandler": "https://github.com/MankaGames/UnityLogger.git"
 ```
 
 To pin a specific commit or tag:
 
 ```json
-"com.manka.loghandler": "git+ssh://git@github.com/MankaGames/UnityLogger.git#v1.0.0"
+"com.manka.loghandler": "https://github.com/MankaGames/UnityLogger.git#v1.0.0"
 ```
 
 ## Usage
