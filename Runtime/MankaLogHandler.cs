@@ -19,6 +19,7 @@ namespace MankaGames
         private readonly HashSet<string> _duplicateSet = new();   // O(1) lookup
 
         private readonly List<string> _writeBuffer = new(256);
+        private bool _lastEntryIsDuplicate;
 
         private int _rewriteLogCount;
         private StreamWriter _streamWriter;
@@ -87,6 +88,7 @@ namespace MankaGames
                 for (int i = 0; i < _writeBuffer.Count; i++)
                     _streamWriter.WriteLine(_writeBuffer[i]);
                 _writeBuffer.Clear();
+                _lastEntryIsDuplicate = false;
             }
 
             _streamWriter.Flush();
@@ -144,10 +146,17 @@ namespace MankaGames
         {
             if (_duplicateSet.Contains(message))
             {
-                _writeBuffer.Add(DuplicateSymbol);
+                if (_lastEntryIsDuplicate && _writeBuffer.Count > 0)
+                    _writeBuffer[_writeBuffer.Count - 1] += DuplicateSymbol;
+                else
+                {
+                    _writeBuffer.Add(DuplicateSymbol);
+                    _lastEntryIsDuplicate = true;
+                }
             }
             else
             {
+                _lastEntryIsDuplicate = false;
                 _duplicateSet.Add(message);
                 _duplicateQueue.Enqueue(message);
                 if (_duplicateQueue.Count > MaxDuplicateBufferCount)
