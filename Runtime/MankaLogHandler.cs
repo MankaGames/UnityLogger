@@ -8,22 +8,23 @@ namespace MankaGames
 {
     public class MankaLogHandler : ILogHandler
     {
-        private ILogHandler _defaultLogHandler = Debug.unityLogger.logHandler;
+        private readonly ILogHandler _defaultLogHandler = Debug.unityLogger.logHandler;
+        private readonly object _sync = new();
         private readonly string _filePath;
         private readonly string[] _prefsKeys;
-
-        // Reused across Log() calls — avoids per-message allocation on the hot path.
-        private readonly StringBuilder _sb = new StringBuilder(256);
+        private readonly string _applicationVersion;
+        private readonly string _deviceInfo;
+        private readonly string _initialPrefsInfo;
 
         private readonly Queue<string> _duplicateQueue = new();   // eviction order
         private readonly HashSet<string> _duplicateSet = new();   // O(1) lookup
 
         private readonly List<string> _writeBuffer = new(256);
         private bool _lastEntryIsDuplicate;
+        private bool _disposed;
 
         private int _rewriteLogCount;
         private StreamWriter _streamWriter;
-        private FileStream _fs;
 
         private const int MaxLogSizeMb = 10;
         private const long MaxLogSizeBytes = MaxLogSizeMb * 1024L * 1024L; // avoids Mathf.Pow at runtime
@@ -37,17 +38,20 @@ namespace MankaGames
         public MankaLogHandler(string[] prefsKeys = null)
         {
             _prefsKeys = prefsKeys;
+            _applicationVersion = Application.version;
             _filePath = Path.Combine(Application.persistentDataPath, Application.productName + ".log");
 
             CheckVersionAndReset();
+            // Rotation can run on any logging thread. Read Unity's device info and prefs at startup.
+            _deviceInfo = BuildDeviceInfo();
+            _initialPrefsInfo = BuildPrefsInfo();
 
             var prevFile = File.Exists(_filePath);
 
-            _fs = new FileStream(_filePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
-            _streamWriter = new StreamWriter(_fs);
+            _streamWriter = new StreamWriter(new FileStream(_filePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite));
             if (!prevFile)
             {
-                _streamWriter.Write(BuildSystemInfo());
+                _streamWriter.Write(BuildSystemInfo(_initialPrefsInfo));
                 _streamWriter.Flush();
             }
             else
@@ -61,26 +65,59 @@ namespace MankaGames
 
         public void Dispose()
         {
-            Debug.unityLogger.logHandler = _defaultLogHandler;
-            _streamWriter.Dispose();
-            _fs.Dispose();
+            lock (_sync)
+            {
+                if (_disposed)
+                    return;
+
+                _disposed = true;
+                if (ReferenceEquals(Debug.unityLogger.logHandler, this))
+                    Debug.unityLogger.logHandler = _defaultLogHandler;
+
+                try
+                {
+                    FlushBufferedEntries();
+                }
+                finally
+                {
+                    _streamWriter.Dispose();
+                }
+            }
         }
 
         public void LogFormat(LogType logType, UnityEngine.Object context, string format, params object[] args)
         {
-            Log(logType, format, args);
+            string message = args == null || args.Length == 0 ? format ?? string.Empty : string.Format(format, args);
+            lock (_sync)
+            {
+                if (!_disposed)
+                    WriteToBuffer(logType, message);
+            }
+
             _defaultLogHandler.LogFormat(logType, context, format, args);
         }
 
         public void LogException(Exception exception, UnityEngine.Object context)
         {
-            // Pass exception message as a plain string, NOT as a format template —
-            // exception messages can contain '{' which would break AppendFormat.
-            LogPlain(LogType.Exception, exception.ToString());
+            lock (_sync)
+            {
+                if (!_disposed)
+                    WriteToBuffer(LogType.Exception, exception.ToString());
+            }
+
             _defaultLogHandler.LogException(exception, context);
         }
 
         public void FlushBuffer()
+        {
+            lock (_sync)
+            {
+                if (!_disposed)
+                    FlushBufferedEntries();
+            }
+        }
+
+        private void FlushBufferedEntries()
         {
             if (_writeBuffer.Count > 0)
             {
@@ -96,7 +133,17 @@ namespace MankaGames
 
         public string GetLogForReport()
         {
-            FlushBuffer();
+            lock (_sync)
+            {
+                if (!_disposed)
+                    FlushBufferedEntries();
+
+                return ReadLogForReport();
+            }
+        }
+
+        private string ReadLogForReport()
+        {
             if (!File.Exists(_filePath))
                 return "no log file found";
 
@@ -108,7 +155,7 @@ namespace MankaGames
                 using var reader = new StreamReader(readFs);
                 string content = reader.ReadToEnd();
                 // Small file: return as-is (already contains the system-info header written on first launch).
-                return string.IsNullOrEmpty(content) ? BuildSystemInfo() + "\n\n[Log file was empty]" : content;
+                return string.IsNullOrEmpty(content) ? BuildSystemInfo(BuildPrefsInfo()) + "\n\n[Log file was empty]" : content;
             }
 
             // Large file: prepend a fresh header and append the last 200 KB.
@@ -121,26 +168,10 @@ namespace MankaGames
             if (firstNewline != -1 && firstNewline < lastPart.Length - 1)
                 lastPart = lastPart.Substring(firstNewline + 1);
 
-            return BuildSystemInfo() + "\n\n[... Log truncated ...]\n\n" + lastPart;
+            return BuildSystemInfo(BuildPrefsInfo()) + "\n\n[... Log truncated ...]\n\n" + lastPart;
         }
 
         // ── Private ───────────────────────────────────────────────────
-
-        private void Log(LogType logType, string format, object[] args)
-        {
-            _sb.Clear();
-            if (args == null || args.Length == 0)
-                _sb.Append(format);
-            else
-                _sb.AppendFormat(format, args);
-
-            WriteToBuffer(logType, _sb.ToString());
-        }
-
-        private void LogPlain(LogType logType, string message)
-        {
-            WriteToBuffer(logType, message);
-        }
 
         private void WriteToBuffer(LogType logType, string message)
         {
@@ -171,17 +202,17 @@ namespace MankaGames
             // Also flush periodically to guard against SIGKILL on mobile.
             bool isError = logType == LogType.Error || logType == LogType.Exception || logType == LogType.Warning;
             if (isError || _writeBuffer.Count >= MaxBufferEntries)
-                FlushBuffer();
+                FlushBufferedEntries();
         }
 
         private string BuildTimeStamp() =>
-            $"--------- ({Application.version}) {DateTime.Now:yyyy-MM-dd HH:mm:ss} ------------";
+            $"--------- ({_applicationVersion}) {DateTime.Now:yyyy-MM-dd HH:mm:ss} ------------";
 
-        private string BuildSystemInfo()
+        private string BuildDeviceInfo()
         {
             var sb = new StringBuilder(1024);
 
-            sb.AppendLine($"--------- {Application.productName} {Application.version} ------------");
+            sb.AppendLine($"--------- {Application.productName} {_applicationVersion} ------------");
             sb.AppendLine();
 
             sb.AppendLine("Device");
@@ -210,26 +241,29 @@ namespace MankaGames
             sb.AppendLine($"  Type: {SystemInfo.processorType}");
             sb.AppendLine($"  Frequency: {SystemInfo.processorFrequency}");
             sb.AppendLine($"  Count: {SystemInfo.processorCount}");
-            sb.AppendLine();
-
-            sb.AppendLine($"  Rewrite log file count: {_rewriteLogCount}");
-            sb.AppendLine();
-
-            if (_prefsKeys != null && _prefsKeys.Length > 0)
-            {
-                sb.AppendLine("--------- ----------- ------------");
-                sb.AppendLine();
-                sb.AppendLine("Player Prefs");
-                foreach (var key in _prefsKeys)
-                    sb.AppendLine($"  {key}: {GetPrefsValue(key)}");
-                sb.AppendLine();
-            }
-
-            sb.AppendLine("--------- ----------- ------------");
-            sb.AppendLine(BuildTimeStamp());
 
             return sb.ToString();
         }
+
+        private string BuildPrefsInfo()
+        {
+            if (_prefsKeys == null || _prefsKeys.Length == 0)
+                return string.Empty;
+
+            var sb = new StringBuilder();
+            sb.AppendLine("--------- ----------- ------------");
+            sb.AppendLine();
+            sb.AppendLine("Player Prefs");
+            foreach (var key in _prefsKeys)
+                sb.AppendLine($"  {key}: {GetPrefsValue(key)}");
+            sb.AppendLine();
+            return sb.ToString();
+        }
+
+        private string BuildSystemInfo(string prefsInfo) =>
+            $"{_deviceInfo}{Environment.NewLine}  Rewrite log file count: {_rewriteLogCount}" +
+            $"{Environment.NewLine}{Environment.NewLine}{prefsInfo}" +
+            $"--------- ----------- ------------{Environment.NewLine}{BuildTimeStamp()}{Environment.NewLine}";
 
         private void TryResetFile()
         {
@@ -239,10 +273,8 @@ namespace MankaGames
 
             _rewriteLogCount++;
             _streamWriter.Dispose();
-            _fs.Dispose();
-            _fs = new FileStream(_filePath, FileMode.Create, FileAccess.Write, FileShare.Read);
-            _streamWriter = new StreamWriter(_fs);
-            _streamWriter.Write(BuildSystemInfo());
+            _streamWriter = new StreamWriter(new FileStream(_filePath, FileMode.Create, FileAccess.Write, FileShare.Read));
+            _streamWriter.Write(BuildSystemInfo(_initialPrefsInfo));
         }
 
         private string ParseStackTrace()
@@ -275,16 +307,15 @@ namespace MankaGames
 
         private void CheckVersionAndReset()
         {
-            string currentVersion = Application.version;
             string lastVersion = PlayerPrefs.GetString(PrefsKeyLastVersion, string.Empty);
-            if (lastVersion == currentVersion)
+            if (lastVersion == _applicationVersion)
                 return;
             if (File.Exists(_filePath))
             {
                 try { File.Delete(_filePath); }
                 catch (Exception e) { Debug.LogException(e); }
             }
-            PlayerPrefs.SetString(PrefsKeyLastVersion, currentVersion);
+            PlayerPrefs.SetString(PrefsKeyLastVersion, _applicationVersion);
             PlayerPrefs.Save();
         }
     }
